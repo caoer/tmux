@@ -16,14 +16,16 @@ jobs:
           - os: ubuntu-22.04
             platform: linux-x86_64
             arch: x86_64
-          - os: ubuntu-22.04
-            platform: linux-aarch64
-            arch: aarch64
+          # Disabled: cross-compilation issues
+          # - os: ubuntu-22.04
+          #   platform: linux-aarch64
+          #   arch: aarch64
 
           # macOS builds
-          - os: macos-15-intel
-            platform: macos-x86_64
-            arch: x86_64
+          # Disabled: macos-15-intel issues
+          # - os: macos-15-intel
+          #   platform: macos-x86_64
+          #   arch: x86_64
           - os: macos-14
             platform: macos-arm64
             arch: arm64
@@ -161,9 +163,9 @@ jobs:
 
           ### Platforms
           - `linux-x86_64`: Linux 64-bit Intel/AMD
-          - `linux-aarch64`: Linux 64-bit ARM (Raspberry Pi, AWS Graviton)
-          - `macos-x86_64`: macOS Intel
-          - `macos-arm64`: macOS Apple Silicon (M1/M2/M3)
+          - `macos-arm64`: macOS Apple Silicon (M1/M2/M3/M4)
+
+          **Note:** Other platforms (Linux ARM64, macOS Intel) require building from source.
 
           ### Build from source
           ```bash
@@ -171,13 +173,11 @@ jobs:
           cd tmux
           git checkout $TAG_NAME
           sh autogen.sh
-          ./configure
+          ./configure --enable-utf8proc  # macOS only
           make -j8
           sudo make install
           ```
           EOF
           )" \
             artifacts/tmux-linux-x86_64/tmux-linux-x86_64.tar.gz \
-            artifacts/tmux-linux-aarch64/tmux-linux-aarch64.tar.gz \
-            artifacts/tmux-macos-x86_64/tmux-macos-x86_64.tar.gz \
             artifacts/tmux-macos-arm64/tmux-macos-arm64.tar.gz
