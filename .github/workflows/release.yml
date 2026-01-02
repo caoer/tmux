@@ -1,0 +1,177 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - '*-zt'
+
+jobs:
+  build:
+    name: Build tmux-${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # Linux builds
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            arch: x86_64
+          - os: ubuntu-22.04
+            platform: linux-aarch64
+            arch: aarch64
+
+          # macOS builds
+          - os: macos-13
+            platform: macos-x86_64
+            arch: x86_64
+          - os: macos-14
+            platform: macos-arm64
+            arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc \
+            make \
+            libevent-dev \
+            libncurses-dev \
+            bison \
+            byacc \
+            pkg-config \
+            autoconf \
+            automake
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install \
+            libevent \
+            ncurses \
+            bison \
+            byacc \
+            pkg-config \
+            autoconf \
+            automake
+
+      - name: Setup cross-compilation for ARM64 (Linux only)
+        if: runner.os == 'Linux' && matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu
+
+          # Set cross-compilation environment
+          echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CXX=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+          echo "AR=aarch64-linux-gnu-ar" >> $GITHUB_ENV
+          echo "RANLIB=aarch64-linux-gnu-ranlib" >> $GITHUB_ENV
+
+      - name: Build tmux
+        run: |
+          sh autogen.sh
+
+          if [ "${{ matrix.arch }}" = "aarch64" ] && [ "${{ runner.os }}" = "Linux" ]; then
+            # Cross-compile for ARM64 Linux
+            ./configure \
+              --prefix=$PWD/install \
+              --host=aarch64-linux-gnu \
+              --enable-static
+          else
+            # Native build
+            ./configure --prefix=$PWD/install
+          fi
+
+          make -j$(nproc || sysctl -n hw.ncpu)
+          make install
+
+          # Create tarball
+          cd install
+          tar -czf ../tmux-${{ matrix.platform }}.tar.gz bin/ share/
+
+      - name: Verify binary
+        if: matrix.arch != 'aarch64' || runner.os != 'Linux'
+        run: |
+          ./install/bin/tmux -V
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmux-${{ matrix.platform }}
+          path: tmux-${{ matrix.platform }}.tar.gz
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: ls -R artifacts
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Extract version from tag
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+
+          # Create release with artifacts
+          gh release create "$TAG_NAME" \
+            --title "tmux $TAG_NAME" \
+            --notes "$(cat <<'EOF'
+          ## tmux Zero Trace Edition
+
+          Custom tmux build with extended synchronized output timeout for better TUI experience.
+
+          ### Changes from upstream
+          - Extended mode 2026 sync timeout: 1s → 6s
+          - Eliminates flickering in Claude Code, lazygit, and similar tools
+          - Based on tmux next-3.7 (master branch)
+
+          ### Installation
+
+          1. Download the appropriate tarball for your platform
+          2. Extract: `tar -xzf tmux-PLATFORM.tar.gz`
+          3. Move to PATH: `sudo mv bin/tmux /usr/local/bin/`
+          4. Verify: `tmux -V`
+
+          ### Platforms
+          - `linux-x86_64`: Linux 64-bit Intel/AMD
+          - `linux-aarch64`: Linux 64-bit ARM (Raspberry Pi, AWS Graviton)
+          - `macos-x86_64`: macOS Intel
+          - `macos-arm64`: macOS Apple Silicon (M1/M2/M3)
+
+          ### Build from source
+          ```bash
+          git clone https://github.com/caoer/tmux.git
+          cd tmux
+          git checkout $TAG_NAME
+          sh autogen.sh
+          ./configure
+          make -j8
+          sudo make install
+          ```
+          EOF
+          )" \
+            artifacts/tmux-linux-x86_64/tmux-linux-x86_64.tar.gz \
+            artifacts/tmux-linux-aarch64/tmux-linux-aarch64.tar.gz \
+            artifacts/tmux-macos-x86_64/tmux-macos-x86_64.tar.gz \
+            artifacts/tmux-macos-arm64/tmux-macos-arm64.tar.gz
