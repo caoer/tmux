@@ -913,7 +913,7 @@ screen_write_sync_callback(__unused int fd, __unused short events, void *arg)
 void
 screen_write_start_sync(struct window_pane *wp)
 {
-	struct timeval	tv = { .tv_sec = 1, .tv_usec = 0 };
+	struct timeval	tv = { .tv_sec = 6, .tv_usec = 0 };
 
 	if (wp == NULL)
 		return;
