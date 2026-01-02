@@ -53,14 +53,38 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install \
-            libevent \
             ncurses \
             bison \
             byacc \
             pkg-config \
             autoconf \
-            automake \
-            utf8proc
+            automake
+
+      - name: Build static dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          PREFIX=$PWD/deps
+          mkdir -p $PREFIX/src
+
+          # Build utf8proc
+          cd $PREFIX/src
+          wget -q "https://github.com/JuliaStrings/utf8proc/releases/download/v2.11.2/utf8proc-2.11.2.tar.gz"
+          tar xzf utf8proc-2.11.2.tar.gz
+          cd utf8proc-2.11.2
+          make -j$(sysctl -n hw.ncpu)
+          make prefix=$PREFIX install
+          rm -f $PREFIX/lib/libutf8proc*.dylib
+
+          # Build libevent
+          cd $PREFIX/src
+          wget -q "https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz"
+          tar xzf libevent-2.1.12-stable.tar.gz
+          cd libevent-2.1.12-stable
+          ./configure --prefix=$PREFIX --disable-shared --disable-openssl --disable-libevent-regress --disable-samples
+          make -j$(sysctl -n hw.ncpu)
+          make install
+
+          rm -rf $PREFIX/src
 
       - name: Setup cross-compilation for ARM64 (Linux only)
         if: runner.os == 'Linux' && matrix.arch == 'aarch64'
@@ -87,8 +111,9 @@ jobs:
               --host=aarch64-linux-gnu \
               --enable-static
           elif [ "${{ runner.os }}" = "macOS" ]; then
-            # macOS build - requires explicit utf8proc flag
-            ./configure \
+            # macOS build with static dependencies
+            PKG_CONFIG_PATH=$PWD/deps/lib/pkgconfig \
+              ./configure \
               --prefix=$PWD/install \
               --enable-utf8proc
           else
@@ -107,6 +132,10 @@ jobs:
         if: matrix.arch != 'aarch64' || runner.os != 'Linux'
         run: |
           ./install/bin/tmux -V
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            echo "Checking dynamic library dependencies:"
+            otool -L ./install/bin/tmux
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
