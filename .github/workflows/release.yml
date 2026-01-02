@@ -43,6 +43,7 @@ jobs:
             make \
             libevent-dev \
             libncurses-dev \
+            libjemalloc-dev \
             bison \
             byacc \
             pkg-config \
@@ -117,8 +118,8 @@ jobs:
               --prefix=$PWD/install \
               --enable-utf8proc
           else
-            # Native Linux build
-            ./configure --prefix=$PWD/install
+            # Native Linux build with jemalloc
+            ./configure --prefix=$PWD/install --enable-jemalloc
           fi
 
           make -j$(nproc || sysctl -n hw.ncpu)
