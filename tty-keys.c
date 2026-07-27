@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: tty-keys.c,v 1.211 2026/07/21 07:12:49 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -495,7 +495,6 @@ tty_keys_build(struct tty *tty)
 	u_int					 i, j;
 	const char				*s;
 	struct options_entry			*o;
-	struct options_array_item		*a;
 	union options_value			*ov;
 	char					 copy[16];
 	key_code				 key;
@@ -532,12 +531,10 @@ tty_keys_build(struct tty *tty)
 
 	o = options_get(global_options, "user-keys");
 	if (o != NULL) {
-		a = options_array_first(o);
-		while (a != NULL) {
-			i = options_array_item_index(a);
-			ov = options_array_item_value(a);
-			tty_keys_add(tty, ov->string, KEYC_USER + i);
-			a = options_array_next(a);
+		for (i = 0; i <= KEYC_NUSER; i++) {
+			ov = options_array_getv(o, "%u", i);
+			if (ov != NULL)
+				tty_keys_add(tty, ov->string, KEYC_USER + i);
 		}
 	}
 }
@@ -605,6 +602,17 @@ tty_keys_find1(struct tty_key *tk, const char *buf, size_t len, size_t *size)
 	return (tty_keys_find1(tk, buf, len, size));
 }
 
+static int
+tty_keys_partial_paste_end(const char *buf, size_t len)
+{
+	static const char	paste_end[] = "\033[201~";
+	size_t			paste_end_len = (sizeof paste_end) - 1;
+
+	if (len == 0 || len >= paste_end_len)
+		return (0);
+	return (memcmp(buf, paste_end, len) == 0);
+}
+
 /* Look up part of the next key. */
 static int
 tty_keys_next1(struct tty *tty, const char *buf, size_t len, key_code *key,
@@ -630,6 +638,10 @@ tty_keys_next1(struct tty *tty, const char *buf, size_t len, key_code *key,
 		if (tk->next != NULL && !expired)
 			return (1);
 		*key = tk->key;
+		if ((*key & KEYC_MASK_KEY) == KEYC_PASTE_START)
+			tty->flags |= TTY_BRACKETPASTE;
+		else if ((*key & KEYC_MASK_KEY) == KEYC_PASTE_END)
+			tty->flags &= ~TTY_BRACKETPASTE;
 		return (0);
 	}
 
@@ -736,7 +748,7 @@ tty_keys_next(struct tty *tty)
 	const char		*buf;
 	size_t			 len, size;
 	cc_t			 bspace;
-	int			 delay, expired = 0, n;
+	int			 delay, expired = 0, n, bg = tty->bg;
 	key_code		 key, onlykey;
 	struct mouse_event	 m = { 0 };
 	struct key_event	*event;
@@ -796,11 +808,15 @@ tty_keys_next(struct tty *tty)
 	switch (tty_keys_colours(tty, buf, len, &size, &tty->fg, &tty->bg)) {
 	case 0:		/* yes */
 		key = KEYC_UNKNOWN;
+		if (tty->bg != bg)
+			server_client_update_theme_colours(c);
 		session_theme_changed(c->session);
 		goto complete_key;
 	case -1:	/* no, or not valid */
 		break;
 	case 1:		/* partial */
+		if (tty->bg != bg)
+			server_client_update_theme_colours(c);
 		session_theme_changed(c->session);
 		goto partial_key;
 	}
@@ -955,9 +971,17 @@ partial_key:
 	delay = options_get_number(global_options, "escape-time");
 	if (delay == 0)
 		delay = 1;
-	if ((tty->flags & (TTY_WAITFG|TTY_WAITBG) ||
-	    (tty->flags & TTY_ALL_REQUEST_FLAGS) != TTY_ALL_REQUEST_FLAGS)) {
-		log_debug("%s: increasing delay for active query", c->name);
+	if ((tty->flags & TTY_BRACKETPASTE) &&
+	    tty_keys_partial_paste_end(buf, len)) {
+		log_debug("%s: increasing delay (partial paste end)", c->name);
+		if (delay < 500)
+			delay = 500;
+	}
+	if (tty->flags & (TTY_WAITFG|TTY_WAITBG) ||
+	    tty->flags & (TTY_OSC52QUERY|TTY_WINSIZEQUERY) ||
+	    (tty->flags & TTY_ALL_REQUEST_FLAGS) != TTY_ALL_REQUEST_FLAGS ||
+	    !TAILQ_EMPTY(&c->input_requests)) {
+		log_debug("%s: increasing delay (active query)", c->name);
 		if (delay < 500)
 			delay = 500;
 	}
@@ -985,10 +1009,10 @@ complete_key:
 	if (key == KEYC_FOCUS_OUT) {
 		c->flags &= ~CLIENT_FOCUSED;
 		window_update_focus(c->session->curw->window);
-		notify_client("client-focus-out", c);
+		events_fire_client("client-focus-out", c);
 	} else if (key == KEYC_FOCUS_IN) {
 		c->flags |= CLIENT_FOCUSED;
-		notify_client("client-focus-in", c);
+		events_fire_client("client-focus-in", c);
 		window_update_focus(c->session->curw->window);
 	}
 
@@ -1309,7 +1333,7 @@ tty_keys_clipboard(struct tty *tty, const char *buf, size_t len, size_t *size)
 {
 	struct client				*c = tty->client;
 	size_t					 end, terminator = 0, needed;
-	char					*copy, *out;
+	char					*copy, *out, clip = 0;
 	int					 outlen;
 	struct input_request_clipboard_data	 cd;
 
@@ -1359,7 +1383,14 @@ tty_keys_clipboard(struct tty *tty, const char *buf, size_t len, size_t *size)
 	/* Adjust end so that it points to the start of the terminator. */
 	end -= terminator - 1;
 
-	/* Get the second argument. */
+	/*
+	 * Save which clipboard was used from the second argument. If more than
+	 * one is specified (should not happen), ignore the argument.
+	 */
+	if (end >= 2 && buf[0] != ';' && buf[1] == ';')
+		clip = buf[0];
+
+	/* Skip the second argument. */
 	while (end != 0 && *buf != ';') {
 		buf++;
 		end--;
@@ -1375,9 +1406,13 @@ tty_keys_clipboard(struct tty *tty, const char *buf, size_t len, size_t *size)
 	copy[end] = '\0';
 
 	/* Convert from base64. */
-	needed = (end / 4) * 3;
+	needed = ((end + 3) / 4) * 3;
+	if (needed == 0) {
+		free(copy);
+		return (0);
+	}
 	out = xmalloc(needed);
-	if ((outlen = b64_pton(copy, out, len)) == -1) {
+	if ((outlen = b64_pton(copy, out, needed)) == -1) {
 		free(out);
 		free(copy);
 		return (0);
@@ -1388,6 +1423,7 @@ tty_keys_clipboard(struct tty *tty, const char *buf, size_t len, size_t *size)
 	/* Set reply if any. */
 	cd.buf = out;
 	cd.len = outlen;
+	cd.clip = clip;
 	input_request_reply(c, INPUT_REQUEST_CLIPBOARD, &cd);
 
 	/* Create a buffer if requested. */
@@ -1611,8 +1647,10 @@ tty_keys_extended_device_attributes(struct tty *tty, const char *buf,
 	}
 	if (i == (sizeof tmp) - 1)
 		return (-1);
-	tmp[i - 1] = '\0';
 	*size = 5 + i;
+	if (i == 0)
+		return (0);
+	tmp[i - 1] = '\0';
 
 	/* Add terminal features. */
 	if (strncmp(tmp, "iTerm2 ", 7) == 0)
@@ -1625,6 +1663,10 @@ tty_keys_extended_device_attributes(struct tty *tty, const char *buf,
 		tty_default_features(features, "mintty", 0);
 	else if (strncmp(tmp, "foot(", 5) == 0)
 		tty_default_features(features, "foot", 0);
+	else if (strncmp(tmp, "WezTerm ", 7) == 0)
+		tty_default_features(features, "WezTerm", 0);
+	else if (strncmp(tmp, "ghostty ", 8) == 0)
+		tty_default_features(features, "ghostty", 0);
 	log_debug("%s: received extended DA %.*s", c->name, (int)*size, buf);
 
 	free(c->term_type);
@@ -1685,12 +1727,15 @@ tty_keys_colours(struct tty *tty, const char *buf, size_t len, size_t *size,
 	}
 	if (i == (sizeof tmp) - 1)
 		return (-1);
+	*size = 6 + i;
+	if (i == 0)
+		return (0);
 	if (tmp[i - 1] == '\033')
 		tmp[i - 1] = '\0';
 	else
 		tmp[i] = '\0';
-	*size = 6 + i;
 
+	/* Work out the colour. */
 	n = colour_parseX11(tmp);
 	if (n != -1 && buf[3] == '0') {
 		if (c != NULL)
@@ -1716,7 +1761,7 @@ static int
 tty_keys_palette(struct tty *tty, const char *buf, size_t len, size_t *size)
 {
 	struct client			 *c = tty->client;
-	u_int				  i, start;
+	u_int				  i;
 	char				  tmp[128], *endptr;
 	int				  idx;
 	struct input_request_palette_data pd;
@@ -1741,32 +1786,35 @@ tty_keys_palette(struct tty *tty, const char *buf, size_t len, size_t *size)
 	if (len == 4)
 		return (1);
 
+	/* Copy the rest up to \033\ or \007. */
+	for (i = 0; i < (sizeof tmp) - 1; i++) {
+		if (4 + i == len)
+			return (1);
+		if (buf[4 + i - 1] == '\033' && buf[4 + i] == '\\')
+			break;
+		if (buf[4 + i] == '\007')
+			break;
+		tmp[i] = buf[4 + i];
+	}
+	if (i == (sizeof tmp) - 1)
+		return (-1);
+	*size = 5 + i;
+	if (i == 0)
+		return (0);
+	if (tmp[i - 1] == '\033')
+		tmp[i - 1] = '\0';
+	else
+		tmp[i] = '\0';
+
 	/* Parse index. */
-	idx = strtol(buf + 4, &endptr, 10);
-	if (endptr == buf + 4 || *endptr != ';')
+	idx = strtol(tmp, &endptr, 10);
+	if (*endptr != ';')
 		return (-1);
 	if (idx < 0 || idx > 255)
 		return (-1);
 
-	/* Copy the rest up to \033\ or \007. */
-	start = (endptr - buf) + 1;
-	for (i = start; i < len && i - start < sizeof tmp; i++) {
-		if (buf[i - 1] == '\033' && buf[i] == '\\')
-			break;
-		if (buf[i] == '\007')
-			break;
-		tmp[i - start] = buf[i];
-	}
-	if (i - start == sizeof tmp)
-		return (-1);
-	if (i > 0 && buf[i - 1] == '\033')
-		tmp[i - start - 1] = '\0';
-	else
-		tmp[i - start] = '\0';
-	*size = i + 1;
-
 	/* Work out the colour. */
-	pd.c = colour_parseX11(tmp);
+	pd.c = colour_parseX11(endptr + 1);
 	if (pd.c == -1)
 		return (0);
 	pd.idx = idx;

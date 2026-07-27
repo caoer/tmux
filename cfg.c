@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cfg.c,v 1.90 2026/07/14 17:17:17 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -56,7 +56,7 @@ cfg_done(__unused struct cmdq_item *item, __unused void *data)
 	if (cfg_item != NULL)
 		cmdq_continue(cfg_item);
 
-	status_prompt_load_history();
+	prompt_load_history();
 
 	return (CMD_RETURN_NORMAL);
 }
@@ -268,7 +268,8 @@ cfg_show_causes(struct session *s)
 
 	wme = TAILQ_FIRST(&wp->modes);
 	if (wme == NULL || wme->mode != &window_view_mode)
-		window_pane_set_mode(wp, NULL, &window_view_mode, NULL, NULL);
+		window_pane_set_mode(wp, NULL, &window_view_mode, NULL, NULL,
+		    NULL);
 	for (i = 0; i < cfg_ncauses; i++) {
 		window_copy_add(wp, 0, "%s", cfg_causes[i]);
 		free(cfg_causes[i]);
